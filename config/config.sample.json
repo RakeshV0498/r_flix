@@ -1,0 +1,26 @@
+{
+  "port": 8080,
+  "servers": [
+    {
+      "name": "Living Room",
+      "url": "http://192.168.1.10:8096",
+      "apiKey": "PASTE_API_KEY_FROM_JELLYFIN_DASHBOARD",
+      "username": "optional: which Jellyfin user's watch history to use with an API key"
+    },
+    {
+      "name": "Basement NAS",
+      "url": "http://192.168.1.20:8096",
+      "username": "your-jellyfin-user",
+      "password": "your-jellyfin-password"
+    }
+  ],
+  "cacheTtlSeconds": 300,
+  "healthIntervalSeconds": 20,
+  "dedupe": { "fallbackToTitleYear": true },
+  "playback": {
+    "maxBitrateMbps": 12,
+    "allowHevc": false,
+    "directPlayAudio": "aac,mp3,opus,flac",
+    "forceTranscode": false
+  }
+}

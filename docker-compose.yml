@@ -1,0 +1,25 @@
+# docker compose up -d --build
+services:
+  r_flix:
+    build: .
+    image: r_flix:latest
+    container_name: r_flix
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Put your config at ./config/config.json (copy config/config.sample.json).
+      - ./config:/config:ro
+    environment:
+      RFLIX_CONFIG: /config/config.json
+      # Or skip the file and set servers here / in an env_file (see .env.example):
+      # JELLYFIN_1_URL: http://192.168.1.10:8096
+      # JELLYFIN_1_API_KEY: ${JELLYFIN_1_API_KEY}
+    # Pi 3B+ has 1 GB RAM: keep the container small (r_flix idles well under 100 MB).
+    mem_limit: 256m
+    # Fewer writes = longer SD card life.
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
