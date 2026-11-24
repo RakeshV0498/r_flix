@@ -52,10 +52,17 @@ const svg = (w, h, title) =>
  */
 export function createMockJellyfin(o) {
   const hasMedia = ensureSampleMedia();
-  const userId = hexId(`${o.name}-user`);
+  // Users: the first is the server's default ("catalogue") user and its administrator.
+  const userNames = o.users || ['demo'];
+  const users = userNames.map((name, i) => ({ name, id: hexId(`${o.name}-user-${name}`), admin: i === 0 }));
+  const userId = users[0].id;
+  const loginUser = o.login && users.find((u) => u.name === o.login.user);
   const loginToken = hexId(`${o.name}-token`);
   const items = new Map(); // id -> item (BaseItemDto-ish)
-  const userData = new Map(); // id -> { PlaybackPositionTicks, Played, LastPlayedDate }
+  const userData = new Map(); // "<userId>:<itemId>" -> { PlaybackPositionTicks, Played, LastPlayedDate }
+  const ud = (uid, id) => userData.get(`${uid}:${id}`);
+  const uidOf = (name) => users.find((u) => u.name === name)?.id;
+  const norm = (id) => String(id || '').replace(/-/g, '').toLowerCase();
   const reports = []; // every playback report received (for assertions)
   const stats = { requests: 0 };
 
@@ -86,16 +93,24 @@ export function createMockJellyfin(o) {
   }
   const byName = (name) => [...items.values()].find((i) => i.Name === name && i.Type !== 'Episode');
   const episodeOf = (series, s, e) => [...items.values()].find((i) => i.SeriesName === series && i.ParentIndexNumber === s && i.IndexNumber === e);
-  for (const [key, w] of Object.entries(o.watch || {})) {
-    const m = /^(.*) S(\d+)E(\d+)$/.exec(key);
-    const it = m ? episodeOf(m[1], +m[2], +m[3]) : byName(key);
-    if (it) userData.set(it.Id, { PlaybackPositionTicks: (w.pos || 0) * 1e7, Played: !!w.played, LastPlayedDate: new Date(Date.now() - (w.agoMin ?? 5) * 60_000).toISOString() });
-  }
+  // o.watch applies to the default user; o.watchFor = { <userName>: { <title>: state } } to others.
+  const seed = (uid, watch) => {
+    for (const [key, w] of Object.entries(watch || {})) {
+      const m = /^(.*) S(\d+)E(\d+)$/.exec(key);
+      const it = m ? episodeOf(m[1], +m[2], +m[3]) : byName(key);
+      if (it) userData.set(`${uid}:${it.Id}`, { PlaybackPositionTicks: (w.pos || 0) * 1e7, Played: !!w.played, LastPlayedDate: new Date(Date.now() - (w.agoMin ?? 5) * 60_000).toISOString() });
+    }
+  };
+  seed(userId, o.watch);
+  for (const [name, w] of Object.entries(o.watchFor || {})) seed(uidOf(name), w);
 
-  const dto = (it) => {
-    const ud = userData.get(it.Id) || {};
+  // The user a request acts as: ?userId=, /Users/{id}/..., or the token's own user.
+  const actor = (req) => norm(req.query.userId || req.params.uid) || (req.jfToken === loginToken ? (loginUser?.id ?? userId) : userId);
+
+  const dto = (it, uid) => {
+    const d = ud(uid, it.Id) || {};
     const { transcode, ...rest } = it; // eslint-disable-line no-unused-vars
-    return { ...rest, UserData: { Played: !!ud.Played, PlaybackPositionTicks: ud.PlaybackPositionTicks || 0, LastPlayedDate: ud.LastPlayedDate, UnplayedItemCount: 0 } };
+    return { ...rest, UserData: { Played: !!d.Played, PlaybackPositionTicks: d.PlaybackPositionTicks || 0, LastPlayedDate: d.LastPlayedDate, UnplayedItemCount: 0 } };
   };
 
   const app = express();
@@ -110,7 +125,7 @@ export function createMockJellyfin(o) {
 
   app.post('/Users/AuthenticateByName', (req, res) => {
     if (o.login && req.body.Username === o.login.user && req.body.Pw === o.login.pass) {
-      return res.json({ AccessToken: loginToken, User: { Id: userId, Name: o.login.user } });
+      return res.json({ AccessToken: loginToken, User: { Id: loginUser?.id ?? userId, Name: o.login.user } });
     }
     res.status(401).end();
   });
@@ -119,7 +134,13 @@ export function createMockJellyfin(o) {
   app.use((req, res, next) => {
     const h = req.get('authorization') || '';
     const token = req.get('x-emby-token') || /Token="([^"]+)"/.exec(h)?.[1] || req.query.api_key;
-    if (token && (token === o.apiKey || token === loginToken)) return next();
+    if (token && (token === o.apiKey || token === loginToken)) {
+      req.jfToken = token;
+      // A non-admin login can only act as itself (like real Jellyfin).
+      const asOther = actor(req) !== (loginUser?.id ?? userId);
+      if (token === loginToken && o.login?.admin === false && asOther) return res.status(403).end();
+      return next();
+    }
     res.status(401).end();
   });
   app.use((req, res, next) => { // so tests can assert the browser never supplied credentials
@@ -127,7 +148,10 @@ export function createMockJellyfin(o) {
     next();
   });
 
-  app.get('/Users', (req, res) => res.json([{ Id: userId, Name: 'demo', Policy: { IsAdministrator: true, IsDisabled: false } }]));
+  app.get('/Users', (req, res) => {
+    if (req.jfToken === loginToken && o.login?.admin === false) return res.status(403).end(); // only admins list users
+    res.json(users.map((u) => ({ Id: u.id, Name: u.name, Policy: { IsAdministrator: u.admin, IsDisabled: false } })));
+  });
 
   app.get('/Items', (req, res) => {
     let list = [...items.values()];
@@ -144,7 +168,7 @@ export function createMockJellyfin(o) {
     const withPeople = String(req.query.Fields || '').includes('People');
     res.json({
       Items: list.slice(start, start + limit).map((i) => ({
-        ...dto(i),
+        ...dto(i, actor(req)),
         ...(withPeople && { People: [{ Name: 'Ada Example', Type: 'Actor', Role: 'Lead' }, { Name: 'Dan Director', Type: 'Director' }], Taglines: ['A sample tagline'] }),
       })),
       TotalRecordCount: list.length,
@@ -152,28 +176,30 @@ export function createMockJellyfin(o) {
   });
 
   const resume = (req, res) => {
+    const uid = actor(req);
     const list = [...items.values()]
-      .filter((i) => ['Movie', 'Episode'].includes(i.Type) && userData.get(i.Id)?.PlaybackPositionTicks > 0 && !userData.get(i.Id).Played)
-      .sort((a, b) => userData.get(b.Id).LastPlayedDate.localeCompare(userData.get(a.Id).LastPlayedDate));
-    res.json({ Items: list.map(dto), TotalRecordCount: list.length });
+      .filter((i) => ['Movie', 'Episode'].includes(i.Type) && ud(uid, i.Id)?.PlaybackPositionTicks > 0 && !ud(uid, i.Id).Played)
+      .sort((a, b) => ud(uid, b.Id).LastPlayedDate.localeCompare(ud(uid, a.Id).LastPlayedDate));
+    res.json({ Items: list.map((i) => dto(i, uid)), TotalRecordCount: list.length });
   };
   // `legacyOnly` mimics an older server that only has the /Users/{id}/... route.
   app.get('/UserItems/Resume', o.legacyOnly ? (req, res) => res.status(404).end() : resume);
-  app.get(`/Users/${userId}/Items/Resume`, resume);
+  app.get('/Users/:uid/Items/Resume', resume);
 
   app.get('/Shows/NextUp', (req, res) => {
     const out = [];
+    const uid = actor(req);
     for (const s of [...items.values()].filter((i) => i.Type === 'Series')) {
       const eps = [...items.values()].filter((i) => i.SeriesId === s.Id).sort((a, b) => a.ParentIndexNumber - b.ParentIndexNumber || a.IndexNumber - b.IndexNumber);
-      const lastPlayed = eps.map((e, idx) => [e, idx]).filter(([e]) => userData.get(e.Id)?.Played).pop();
-      if (lastPlayed && eps[lastPlayed[1] + 1] && !userData.get(eps[lastPlayed[1] + 1].Id)?.PlaybackPositionTicks) out.push(eps[lastPlayed[1] + 1]);
+      const lastPlayed = eps.map((e, idx) => [e, idx]).filter(([e]) => ud(uid, e.Id)?.Played).pop();
+      if (lastPlayed && eps[lastPlayed[1] + 1] && !ud(uid, eps[lastPlayed[1] + 1].Id)?.PlaybackPositionTicks) out.push(eps[lastPlayed[1] + 1]);
     }
-    res.json({ Items: out.map(dto), TotalRecordCount: out.length });
+    res.json({ Items: out.map((i) => dto(i, uid)), TotalRecordCount: out.length });
   });
 
   app.get('/Shows/:id/Episodes', (req, res) => {
     const eps = [...items.values()].filter((i) => i.SeriesId === req.params.id);
-    res.json({ Items: eps.map(dto), TotalRecordCount: eps.length });
+    res.json({ Items: eps.map((i) => dto(i, actor(req))), TotalRecordCount: eps.length });
   });
 
   app.post('/Items/:id/PlaybackInfo', (req, res) => {
@@ -209,11 +235,12 @@ export function createMockJellyfin(o) {
   const saveUserData = (req, res) => {
     const id = req.params.id;
     if (!items.has(id)) return res.status(404).end();
-    userData.set(id, { ...(userData.get(id) || {}), ...req.body });
+    const key = `${actor(req)}:${id}`;
+    userData.set(key, { ...(userData.get(key) || {}), ...req.body });
     res.status(204).end();
   };
   app.post('/UserItems/:id/UserData', saveUserData);
-  app.post(`/Users/${userId}/Items/:id/UserData`, saveUserData);
+  app.post('/Users/:uid/Items/:id/UserData', saveUserData);
 
   // ---- artwork: generated SVG; episodes have 16:9 stills, titles have portrait posters
   app.get('/Items/:id/Images/:kind', (req, res) => {
@@ -240,7 +267,7 @@ export function createMockJellyfin(o) {
 
   let httpServer;
   return {
-    app, items, userData, reports, stats, userId, hasMedia,
+    app, items, userData, reports, stats, userId, users, hasMedia, ud,
     /** Listen on a port (0 = random). Resolves to the base URL. */
     start: (port = 0, host = '127.0.0.1') => new Promise((resolve) => {
       httpServer = app.listen(port, host, () => resolve(`http://${host}:${httpServer.address().port}`));

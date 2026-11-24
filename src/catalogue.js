@@ -1,21 +1,25 @@
 /**
  * The unified catalogue.
  *
- * Each server's movie/series list is fetched in parallel and cached. The
- * per-server lists are then merged into "groups": one group per distinct title,
- * holding one "variant" per server that has a copy. Titles are matched by
- * provider ids (TMDB / IMDb / TVDB); see dedupeKeys().
+ * Each server's movie/series list is fetched and cached (one server at a time, to keep memory
+ * low on a Pi). The per-server lists are merged into "groups": one group per distinct title,
+ * holding one "variant" per server that has a copy. Titles are matched by provider ids
+ * (TMDB / IMDb / TVDB); see dedupeKeys().
  *
- * The browser only sees "cards" (serialised groups) addressed by uid (ids.js).
- * Whichever variant is on a reachable server, in config priority order, is the
- * one used for metadata, artwork and playback.
+ * The LIBRARY (what titles exist) is shared and built from each server's default user. WATCH
+ * STATE (played, progress, Continue Watching) is per r_flix user: each user can be mapped to a
+ * Jellyfin user on every server, and their own state is fetched live and overlaid on the cards.
+ * A user with no mapping on a server shares that server's default user's history.
+ *
+ * The browser only sees "cards" (serialised groups) addressed by uid (ids.js). Whichever variant
+ * is on a reachable server, in priority order, is the one used for metadata, artwork and playback.
  */
 import { encodeUid, decodeUid, cleanId } from './ids.js';
 
 const TICKS_PER_MIN = 600_000_000;
 const PAGE = 200; // small pages keep peak memory low on a 1 GB Pi
 const OVERVIEW_MAX = 300; // the library cache keeps a short synopsis; the title page fetches the full text
-const EP_CACHE_MAX = 6;
+const EP_CACHE_MAX = 12;
 const PROVIDERS = ['tmdb', 'imdb', 'tvdb'];
 
 // ------------------------------------------------------------------ pure helpers
@@ -133,38 +137,70 @@ export function mergeLibraries(libs, { fallbackToTitleYear = true } = {}) {
 }
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const maxAdded = (g) => Math.max(...g.variants.map((v) => v.item.added));
 
 // ------------------------------------------------------------------- catalogue
 
+/**
+ * @typedef {{id:number, map:Record<number,string>}} UserCtx  the signed-in r_flix user and
+ *   their Jellyfin user id per server slot (set by the auth middleware)
+ */
 export class Catalogue {
-  /** @param {import('./jellyfin.js').JellyfinServer[]} servers */
-  constructor(servers, cfg) {
-    this.servers = servers;
-    this.cfg = cfg;
-    this.libs = new Map(); // server index -> { items, fetchedAt }
-    this.loading = new Map(); // server index -> in-flight promise
+  /**
+   * @param {import('./servers.js').ServerRegistry} registry
+   * @param {import('./settings.js').Settings} settings
+   */
+  constructor(registry, settings) {
+    this.reg = registry;
+    this.settings = settings;
+    this.libs = new Map(); // server slot -> { items, fetchedAt }
+    this.loading = new Map(); // server slot -> in-flight promise
     this.groups = [];
     this.byUid = new Map();
-    this.byServerId = new Map(); // "s:jellyfinId" -> group
-    this.epCache = new Map(); // series uid -> { at, data }
+    this.byServerId = new Map(); // "slot:jellyfinId" -> group
+    this.epCache = new Map(); // "seriesUid|userId" -> { at, data }
     this.timer = null;
     this.queue = Promise.resolve(); // library loads run one at a time to keep memory low
 
-    for (const srv of servers) {
-      // When a server comes back, pull its library immediately.
-      srv.on('online', () => this.loadServer(srv.index));
-    }
+    // React to admin changes and server recoveries.
+    registry.on('serverOnline', (slot) => this.loadServer(slot));
+    registry.on('changed', ({ type, slot, reload }) => {
+      if (type === 'removed') this.dropServer(slot);
+      else if (type === 'reordered') this.rebuild();
+      else if (reload) {
+        this.libs.delete(slot); // credentials/URL changed: the old list may belong to another server
+        this.rebuild();
+        this.loadServer(slot);
+      }
+    });
+    settings.on('change', (keys) => {
+      if (keys.includes('cacheTtlSeconds')) this.schedule();
+      if (keys.includes('dedupe.fallbackToTitleYear')) this.rebuild();
+    });
+  }
+
+  get cfg() {
+    return this.settings.values;
   }
 
   /** Initial load + periodic refresh. */
   start() {
-    for (const srv of this.servers) this.loadServer(srv.index);
+    for (const srv of this.reg.list()) this.loadServer(srv.index);
+    this.schedule();
+  }
+
+  schedule() {
+    clearInterval(this.timer);
     this.timer = setInterval(() => this.refreshAll(), this.cfg.cacheTtlSeconds * 1000);
     this.timer.unref();
   }
 
+  stop() {
+    clearInterval(this.timer);
+  }
+
   refreshAll() {
-    return Promise.allSettled(this.servers.filter((s) => s.online !== false).map((s) => this.loadServer(s.index)));
+    return Promise.allSettled(this.reg.list().filter((s) => s.online !== false).map((s) => this.loadServer(s.index)));
   }
 
   /** Wait (bounded) for servers that have never loaded, so the first request isn't empty. */
@@ -176,31 +212,46 @@ export class Catalogue {
   }
 
   /** Fetch one server's whole movie/series list. Keeps the old copy if this fails. */
-  loadServer(index) {
-    if (this.loading.has(index)) return this.loading.get(index);
-    const srv = this.servers[index];
+  loadServer(slot) {
+    if (this.loading.has(slot)) return this.loading.get(slot);
     const p = (this.queue = this.queue.then(async () => {
+      const srv = this.reg.get(slot);
+      let replaced = false;
       try {
+        if (!srv) return;
         const items = [];
         for (let start = 0; ; start += PAGE) {
           const page = await srv.libraryPage(start, PAGE);
-          for (const it of page?.Items || []) items.push(slim(it, index));
+          for (const it of page?.Items || []) items.push(slim(it, slot));
           if (!page?.Items?.length || start + PAGE >= (page.TotalRecordCount ?? 0)) break;
         }
-        this.libs.set(index, { items, fetchedAt: Date.now() });
+        if (this.reg.get(slot) !== srv) {
+          replaced = true; // edited or removed while we were fetching: this list is stale
+          return;
+        }
+        this.libs.set(slot, { items, fetchedAt: Date.now() });
         this.rebuild();
       } catch (err) {
-        console.warn(`[catalogue] ${srv.name}: library fetch failed: ${err.message}` + (this.libs.has(index) ? ' (using cached copy)' : ''));
+        console.warn(`[catalogue] ${srv?.name ?? `slot ${slot}`}: library fetch failed: ${err.message}` + (this.libs.has(slot) ? ' (using cached copy)' : ''));
       } finally {
-        this.loading.delete(index);
+        this.loading.delete(slot);
+        if (replaced && this.reg.get(slot)) queueMicrotask(() => this.loadServer(slot)); // fetch from the new connection
       }
     }));
-    this.loading.set(index, p);
+    this.loading.set(slot, p);
     return p;
   }
 
+  dropServer(slot) {
+    this.libs.delete(slot);
+    this.rebuild();
+  }
+
   rebuild() {
-    const libs = [...this.libs.entries()].sort(([a], [b]) => a - b).map(([s, l]) => ({ s, items: l.items }));
+    const libs = [...this.libs.entries()]
+      .filter(([s]) => this.reg.get(s)) // servers that were removed/disabled drop out
+      .sort(([a], [b]) => this.reg.rank(a) - this.reg.rank(b))
+      .map(([s, l]) => ({ s, items: l.items }));
     this.groups = mergeLibraries(libs, { fallbackToTitleYear: this.cfg.dedupe.fallbackToTitleYear });
     this.byUid = new Map();
     this.byServerId = new Map();
@@ -223,12 +274,50 @@ export class Catalogue {
   }
 
   isUp(s) {
-    return this.servers[s]?.online !== false;
+    const srv = this.reg.get(s);
+    return !!srv && srv.online !== false;
   }
 
   /** The variant to use right now: first (highest priority) on a reachable server. */
   pick(group) {
     return group.variants.find((v) => this.isUp(v.s)) || group.variants[0];
+  }
+
+  // ------------------------------------------------------------- per-user state
+
+  /** The Jellyfin user to act as on `slot` for this r_flix user (undefined = server's default user). */
+  jfUser(user, slot) {
+    return user?.map?.[slot] || undefined;
+  }
+
+  hasMappings(user) {
+    return !!user && Object.keys(user.map || {}).length > 0;
+  }
+
+  /**
+   * Fetch this user's own watch state for the given groups (one request per server).
+   * Users with no Jellyfin mapping skip this and use the cached default-user state.
+   * @returns {Promise<Map<string, object>|null>} uid -> merged state, or null when not needed
+   */
+  async overlay(user, groups) {
+    if (!this.hasMappings(user) || !groups.length) return null;
+    const bySlot = new Map();
+    for (const g of groups) for (const v of g.variants) if (this.isUp(v.s)) (bySlot.get(v.s) || bySlot.set(v.s, []).get(v.s)).push(v.id);
+    const states = new Map(); // "slot:id" -> state
+    await Promise.allSettled(
+      [...bySlot].map(async ([slot, ids]) => {
+        const m = await this.reg.get(slot).userStates(ids, this.jfUser(user, slot));
+        for (const [id, ud] of m) states.set(`${slot}:${id}`, slimUd(ud));
+      }),
+    );
+    const out = new Map();
+    for (const g of groups) {
+      out.set(
+        g.uid,
+        mergeUd(g.variants.map((v) => states.get(`${v.s}:${v.id}`) ?? (this.jfUser(user, v.s) ? undefined : v.item.ud))),
+      );
+    }
+    return out;
   }
 
   // --------------------------------------------------------------- serialisation
@@ -257,32 +346,30 @@ export class Catalogue {
       backdrop: m.hasBackdrop,
       logo: m.hasLogo,
       available: group.variants.some((x) => this.isUp(x.s)),
-      servers: group.variants.map((x) => this.servers[x.s].name),
+      servers: group.variants.map((x) => this.reg.get(x.s)?.name ?? '?'),
     };
+  }
+
+  /** Cards for a list of groups, with the user's own watch state applied. */
+  async cards(user, groups) {
+    const ov = await this.overlay(user, groups);
+    return groups.map((g) => this.card(g, ov?.get(g.uid)));
   }
 
   // ----------------------------------------------------------------- catalogue views
 
   /** Home page: hero + rows. */
-  async home() {
+  async home(user) {
     await this.ensureLoaded();
     const byAdded = [...this.groups].sort((a, b) => maxAdded(b) - maxAdded(a));
     const byRating = (arr) => [...arr].sort((a, b) => (this.pick(b).item.rating || 0) - (this.pick(a).item.rating || 0));
     const movies = this.groups.filter((g) => g.type === 'Movie');
     const shows = this.groups.filter((g) => g.type === 'Series');
 
-    const rows = [];
-    const add = (id, title, kind, groups, extra = {}) => {
-      const items = groups.slice(0, 30).map((g) => this.card(g));
-      if (items.length) rows.push({ id, title, kind, items, ...extra });
-    };
-
-    const cont = await this.continueWatching();
-    if (cont.length) rows.push({ id: 'continue', title: 'Continue Watching', kind: 'landscape', items: cont });
-    add('recent', 'Recently Added', 'poster', byAdded);
-    add('movies', 'Movies', 'poster', byRating(movies), { more: '#/movies' });
-    add('shows', 'TV Shows', 'poster', byRating(shows), { more: '#/shows' });
-
+    const defs = []; // [id, title, kind, groups, extra]
+    defs.push(['recent', 'Recently Added', 'poster', byAdded.slice(0, 30), {}]);
+    defs.push(['movies', 'Movies', 'poster', byRating(movies).slice(0, 30), { more: '#/movies' }]);
+    defs.push(['shows', 'TV Shows', 'poster', byRating(shows).slice(0, 30), { more: '#/shows' }]);
     // A few genre rows, biggest genres first.
     const counts = new Map();
     for (const g of this.groups) for (const genre of this.pick(g).item.genres) counts.set(genre, (counts.get(genre) || 0) + 1);
@@ -290,13 +377,23 @@ export class Catalogue {
       .filter(([, n]) => n >= 6)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
-      .forEach(([genre]) => add(`genre-${genre}`, genre, 'poster', byAdded.filter((g) => this.pick(g).item.genres.includes(genre))));
+      .forEach(([genre]) => defs.push([`genre-${genre}`, genre, 'poster', byAdded.filter((g) => this.pick(g).item.genres.includes(genre)).slice(0, 30), {}]));
 
-    return { featured: this.featured(byAdded), rows };
+    const featuredGroup = this.featuredGroup(byAdded);
+    const cont = await this.continueWatching(user);
+    // One overlay request per server covers every card on the page.
+    const all = [...new Map([...defs.flatMap((d) => d[3]), ...(featuredGroup ? [featuredGroup] : [])].map((g) => [g.uid, g])).values()];
+    const ov = await this.overlay(user, all);
+    const toCard = (g) => this.card(g, ov?.get(g.uid));
+
+    const rows = [];
+    if (cont.length) rows.push({ id: 'continue', title: 'Continue Watching', kind: 'landscape', items: cont });
+    for (const [id, title, kind, groups, extra] of defs) if (groups.length) rows.push({ id, title, kind, items: groups.map(toCard), ...extra });
+    return { featured: featuredGroup ? toCard(featuredGroup) : null, rows };
   }
 
   /** Hero title: rotates hourly among the newest titles that have a backdrop and a synopsis. */
-  featured(byAdded) {
+  featuredGroup(byAdded) {
     const top = byAdded
       .filter((g) => {
         const v = this.pick(g);
@@ -304,20 +401,20 @@ export class Catalogue {
       })
       .slice(0, 20);
     if (!top.length) return null;
-    const hour = Math.floor(Date.now() / 3_600_000);
-    return this.card(top[hour % top.length]);
+    return top[Math.floor(Date.now() / 3_600_000) % top.length];
   }
 
   /**
-   * "Continue Watching": resume points + next-up episodes from every reachable
+   * "Continue Watching" for one user: resume points + next-up episodes from every reachable
    * server, merged so a title partly watched on both servers shows once.
    */
-  async continueWatching(limit = 20) {
+  async continueWatching(user, limit = 20) {
     await this.ensureLoaded();
     const per = await Promise.allSettled(
-      this.servers.map(async (srv) => {
+      this.reg.list().map(async (srv) => {
         if (srv.online === false) return [];
-        const [resume, next] = await Promise.allSettled([srv.resume(limit), srv.nextUp(limit)]);
+        const jf = this.jfUser(user, srv.index);
+        const [resume, next] = await Promise.allSettled([srv.resume(jf, limit), srv.nextUp(jf, limit)]);
         return [
           ...(resume.value || []).map((it) => ({ srv, it, resume: true })),
           ...(next.value || []).map((it) => ({ srv, it, resume: false })),
@@ -337,7 +434,7 @@ export class Catalogue {
           key = group?.uid;
         } else if (item.type === 'Episode') {
           const series = item.seriesId && this.byServerId.get(`${srv.index}:${item.seriesId}`);
-          const eps = series && (await this.episodesOf(series).catch(() => null));
+          const eps = series && (await this.episodesOf(series, user).catch(() => null));
           const ep = eps?.byKey.get(`${item.season}:${item.number}`);
           group = ep?.group;
           key = ep?.group.uid;
@@ -347,8 +444,6 @@ export class Catalogue {
           group = { type: item.type, variants: [{ s: srv.index, id: item.id, item }], uid: encodeUid([{ s: srv.index, id: item.id }]) };
           key = group.uid;
         }
-        // Next-up episodes of a series already in progress are redundant with its resume point
-        // but a series fully caught up only appears here, so keep both and let sorting decide.
         const slot = merged.get(key) || { group, uds: [], last: 0, resume: false };
         slot.uds.push(item.ud);
         slot.last = Math.max(slot.last, item.ud.last);
@@ -369,7 +464,7 @@ export class Catalogue {
   }
 
   /** Browse grid with filter/sort/paging. */
-  browse({ type, genre, sort = 'added', offset = 0, limit = 60 }) {
+  async browse(user, { type, genre, sort = 'added', offset = 0, limit = 60 }) {
     let list = this.groups.filter((g) => !type || g.type === type);
     const genres = [...new Set(list.flatMap((g) => this.pick(g).item.genres))].sort();
     if (genre) list = list.filter((g) => this.pick(g).item.genres.includes(genre));
@@ -381,11 +476,11 @@ export class Catalogue {
       rating: (a, b) => (m(b).rating || 0) - (m(a).rating || 0),
     };
     list = [...list].sort(sorters[sort] || sorters.added);
-    return { total: list.length, genres, items: list.slice(offset, offset + limit).map((g) => this.card(g)) };
+    return { total: list.length, genres, items: await this.cards(user, list.slice(offset, offset + limit)) };
   }
 
   /** Search the merged catalogue (titles, then genres). Runs locally, so it works with a server offline. */
-  search(q, limit = 60) {
+  async search(user, q, limit = 60) {
     const term = normTitle(q);
     if (!term) return [];
     const scored = [];
@@ -401,22 +496,23 @@ export class Catalogue {
       else if (String(m.year) === term) score = 15;
       if (score) scored.push([score + (m.rating || 0) / 10, g]);
     }
-    return scored.sort((a, b) => b[0] - a[0]).slice(0, limit).map(([, g]) => this.card(g));
+    return this.cards(user, scored.sort((a, b) => b[0] - a[0]).slice(0, limit).map(([, g]) => g));
   }
 
   // ------------------------------------------------------------ episodes & details
 
   /**
-   * All episodes of a series, merged across every reachable server that has it.
-   * Episodes are matched on season + episode number.
+   * All episodes of a series, merged across every reachable server that has it, with this
+   * user's watch state. Episodes are matched on season + episode number.
    * @returns {{seasons:object[], flat:object[], byKey:Map}}
    */
-  async episodesOf(group) {
-    const hit = this.epCache.get(group.uid);
+  async episodesOf(group, user) {
+    const cacheKey = `${group.uid}|${user?.id ?? 0}`;
+    const hit = this.epCache.get(cacheKey);
     if (hit && Date.now() - hit.at < 20_000) return hit.data;
 
     const live = group.variants.filter((v) => this.isUp(v.s));
-    const lists = await Promise.allSettled(live.map(async (v) => ({ v, items: await this.servers[v.s].episodes(v.id) })));
+    const lists = await Promise.allSettled(live.map(async (v) => ({ v, items: await this.reg.get(v.s).episodes(v.id, this.jfUser(user, v.s)) })));
     const ok = lists.filter((r) => r.status === 'fulfilled').map((r) => r.value);
     if (!ok.length) throw lists.find((r) => r.status === 'rejected')?.reason || new Error('No server reachable for this series');
 
@@ -432,7 +528,7 @@ export class Catalogue {
     }
     const flat = [...eps.values()]
       .map((e) => {
-        e.variants.sort((a, b) => a.s - b.s);
+        e.variants.sort((a, b) => this.reg.rank(a.s) - this.reg.rank(b.s));
         e.uid = encodeUid(e.variants);
         e.type = 'Episode';
         const m = e.variants[0].item;
@@ -470,21 +566,21 @@ export class Catalogue {
     }));
     const data = { seasons, flat, byKey: new Map(flat.map((e) => [e.key, e])) };
     if (this.epCache.size >= EP_CACHE_MAX) this.epCache.delete(this.epCache.keys().next().value);
-    this.epCache.set(group.uid, { at: Date.now(), data });
+    this.epCache.set(cacheKey, { at: Date.now(), data });
     return data;
   }
 
-  /** Full details for the title page. Live-fetched so watch state is current. */
-  async details(uid) {
+  /** Full details for the title page. Live-fetched so this user's watch state is current. */
+  async details(uid, user) {
     const group = this.groupFor(uid);
     if (!group) return null;
     const live = group.variants.filter((v) => this.isUp(v.s));
-    const fetched = await Promise.allSettled(live.map((v) => this.servers[v.s].item(v.id)));
+    const fetched = await Promise.allSettled(live.map((v) => this.reg.get(v.s).item(v.id, this.jfUser(user, v.s))));
     const items = fetched.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
     const uds = items.map((it) => slimUd(it.UserData));
     const full = items[0]; // highest-priority reachable copy
-    const card = this.card(group, uds.length ? mergeUd(uds) : undefined);
-    const state = uds.length ? mergeUd(uds) : mergeUd(group.variants.map((v) => v.item.ud));
+    const state = uds.length ? mergeUd(uds) : undefined;
+    const card = this.card(group, state);
     const people = full?.People || [];
     return {
       ...card,
@@ -493,9 +589,22 @@ export class Catalogue {
       studios: (full?.Studios || []).map((s) => s.Name).slice(0, 3),
       cast: people.filter((p) => p.Type === 'Actor').slice(0, 12).map((p) => ({ name: p.Name, role: p.Role || null })),
       directors: people.filter((p) => p.Type === 'Director').map((p) => p.Name).slice(0, 3),
-      resumeSeconds: !state.played && state.pos > 0 ? Math.floor(state.pos / 1e7) : 0,
+      resumeSeconds: state && !state.played && state.pos > 0 ? Math.floor(state.pos / 1e7) : 0,
+    };
+  }
+
+  /** Numbers for the Admin status tab. */
+  stats() {
+    const dupes = this.groups.filter((g) => g.variants.length > 1).length;
+    return {
+      titles: this.groups.length,
+      movies: this.groups.filter((g) => g.type === 'Movie').length,
+      series: this.groups.filter((g) => g.type === 'Series').length,
+      onMultipleServers: dupes,
+      servers: this.reg.list().map((s) => {
+        const lib = this.libs.get(s.index);
+        return { slot: s.index, name: s.name, items: lib?.items.length ?? 0, fetchedAt: lib?.fetchedAt ?? null, loading: this.loading.has(s.index) };
+      }),
     };
   }
 }
-
-const maxAdded = (g) => Math.max(...g.variants.map((v) => v.item.added));

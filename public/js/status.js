@@ -1,12 +1,13 @@
 /**
- * Server status indicator: one dot per Jellyfin server (green = ok, amber = login
- * problem, red = unreachable) plus a banner when something is down. The app keeps
- * working from whichever server is up; this just says what's going on.
+ * Server status indicator: one dot per Jellyfin server (green = ok, amber = login problem, red =
+ * unreachable) plus a banner when something is down. The app keeps working from whichever server
+ * is up; this just says what's going on.
  */
 import { h } from './util.js';
 import { get } from './api.js';
 
 let last = '';
+let timer = null;
 
 function render(servers) {
   const pill = document.getElementById('status');
@@ -36,13 +37,23 @@ function render(servers) {
 async function poll() {
   try {
     render((await get('/api/status')).servers);
-  } catch {
+  } catch (err) {
+    if (err.status === 401) return; // the app is already showing the sign-in page
     document.getElementById('banner').hidden = false;
     document.getElementById('banner').textContent = 'Lost connection to r_flix.';
   }
 }
 
-export function initStatus() {
+export function startStatus() {
+  stopStatus();
   poll();
-  setInterval(poll, 15000);
+  timer = setInterval(poll, 15000);
+}
+
+export function stopStatus() {
+  clearInterval(timer);
+  timer = null;
+  last = '';
+  document.getElementById('status').replaceChildren();
+  document.getElementById('banner').hidden = true;
 }

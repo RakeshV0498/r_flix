@@ -1,4 +1,5 @@
 {
+  "_note": "OPTIONAL. r_flix is configured on its Admin page. If the database has no servers yet, this file (or JELLYFIN_<n>_* variables) is imported ONCE at start-up, then ignored.",
   "port": 8080,
   "servers": [
     {
@@ -16,7 +17,9 @@
   ],
   "cacheTtlSeconds": 300,
   "healthIntervalSeconds": 20,
-  "dedupe": { "fallbackToTitleYear": true },
+  "dedupe": {
+    "fallbackToTitleYear": true
+  },
   "playback": {
     "maxBitrateMbps": 12,
     "allowHevc": false,

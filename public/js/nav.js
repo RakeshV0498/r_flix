@@ -90,6 +90,8 @@ export function initNav({ goBack }) {
 
     const dir = KEY_DIR[e.key];
     if (!dir) return;
+    // Dropdowns and multi-line boxes use the arrow keys themselves.
+    if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
     // Inside a text box, left/right edit text; up/down leave it.
     if (typing && (dir === 'left' || dir === 'right')) return;
     e.preventDefault();

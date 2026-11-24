@@ -57,27 +57,45 @@ export function deviceProfile(pb) {
 }
 
 export class Playback {
-  constructor(servers, catalogue, cfg) {
-    this.servers = servers;
+  /**
+   * @param {import('./servers.js').ServerRegistry} registry
+   * @param {import('./catalogue.js').Catalogue} catalogue
+   * @param {import('./settings.js').Settings} settings  live: playback options apply immediately
+   */
+  constructor(registry, catalogue, settings) {
+    this.reg = registry;
     this.catalogue = catalogue;
-    this.cfg = cfg;
-    this.profile = deviceProfile(cfg.playback);
+    this.settings = settings;
+    this.profile = deviceProfile(settings.values.playback);
+    settings.on('change', () => {
+      this.profile = deviceProfile(settings.values.playback);
+    });
+  }
+
+  get cfg() {
+    return this.settings.values;
+  }
+
+  /** Jellyfin user to act as for this r_flix user on `slot` (undefined = the server's default user). */
+  jf(user, slot) {
+    return this.catalogue.jfUser(user, slot);
   }
 
   /**
    * Work out how to play `uid` right now.
    * @param {string} uid
+   * @param {import('./catalogue.js').UserCtx} user  whose watch state decides the resume position
    * @param {{exclude?:Set<number>, start?:number, forceTranscode?:boolean}} opts
-   *   exclude: server indexes to skip (the player passes the one that just failed)
+   *   exclude: server slots to skip (the player passes the one that just failed)
    */
-  async prepare(uid, { exclude = new Set(), start, forceTranscode = false } = {}) {
+  async prepare(uid, user, { exclude = new Set(), start, forceTranscode = false } = {}) {
     const variants = decodeUid(uid);
     if (!variants) throw new HttpError(400, 'Bad item id');
-    const usable = variants.filter((v) => this.servers[v.s] && !exclude.has(v.s) && this.servers[v.s].online !== false);
+    const usable = variants.filter((v) => this.reg.get(v.s) && !exclude.has(v.s) && this.reg.get(v.s).online !== false);
     if (!usable.length) throw new HttpError(503, 'No reachable server has this title right now');
 
-    // Metadata + watch state from every reachable copy (for the resume position).
-    const fetched = await Promise.allSettled(usable.map((v) => this.servers[v.s].item(v.id)));
+    // Metadata + this user's watch state from every reachable copy (for the resume position).
+    const fetched = await Promise.allSettled(usable.map((v) => this.reg.get(v.s).item(v.id, this.jf(user, v.s))));
     const items = fetched.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
     const meta = items[0];
     const ud = mergeUd(items.map((it) => slimUd(it.UserData)));
@@ -85,19 +103,23 @@ export class Playback {
     const force = forceTranscode || this.cfg.playback.forceTranscode;
     let lastErr;
     for (const v of usable) {
-      const srv = this.servers[v.s];
+      const srv = this.reg.get(v.s);
       try {
-        const info = await srv.playbackInfo(v.id, {
-          DeviceProfile: this.profile,
-          MaxStreamingBitrate: this.profile.MaxStreamingBitrate,
-          AutoOpenLiveStream: false,
-          EnableDirectPlay: !force,
-          EnableDirectStream: !force,
-          EnableTranscoding: true,
-        });
+        const info = await srv.playbackInfo(
+          v.id,
+          {
+            DeviceProfile: this.profile,
+            MaxStreamingBitrate: this.profile.MaxStreamingBitrate,
+            AutoOpenLiveStream: false,
+            EnableDirectPlay: !force,
+            EnableDirectStream: !force,
+            EnableTranscoding: true,
+          },
+          this.jf(user, v.s),
+        );
         const ms = info?.MediaSources?.[0];
         if (!ms || info.ErrorCode) throw new Error(info?.ErrorCode || 'no playable media source');
-        return await this._describe({ v, srv, info, ms, meta, ud, start, force });
+        return await this._describe({ v, srv, info, ms, meta, ud, start, force, user });
       } catch (err) {
         lastErr = err; // try the next copy on another server
       }
@@ -105,7 +127,7 @@ export class Playback {
     throw new HttpError(502, `Could not start playback: ${lastErr?.message || 'unknown error'}`);
   }
 
-  async _describe({ v, srv, info, ms, meta, ud, start, force }) {
+  async _describe({ v, srv, info, ms, meta, ud, start, force, user }) {
     const playSessionId = info.PlaySessionId;
     let url, mode, playMethod;
     if (ms.SupportsDirectPlay && !force) {
@@ -158,16 +180,16 @@ export class Playback {
       next: null,
       seriesId: null,
     };
-    if (isEp) Object.assign(out, await this._episodeContext(v.s, meta));
+    if (isEp) Object.assign(out, await this._episodeContext(v.s, meta, user));
     return out;
   }
 
   /** For an episode: the parent series uid and the following episode (for "Next episode"). */
-  async _episodeContext(s, ep) {
+  async _episodeContext(s, ep, user) {
     try {
       const series = ep.SeriesId && this.catalogue.byServerId.get(`${s}:${ep.SeriesId.replace(/-/g, '')}`);
       if (!series) return {};
-      const { flat, byKey } = await this.catalogue.episodesOf(series);
+      const { flat, byKey } = await this.catalogue.episodesOf(series, user);
       const cur = byKey.get(`${ep.ParentIndexNumber ?? 0}:${ep.IndexNumber}`);
       const next = cur && flat[flat.indexOf(cur) + 1];
       return {
@@ -183,25 +205,32 @@ export class Playback {
    * Handle a progress report from the player.
    * The session report goes to the server being streamed from (keeps its
    * dashboard and transcode lifecycle right); the resume position is written to
-   * EVERY reachable copy so watch state stays in sync across servers.
+   * EVERY reachable copy — as THIS user's Jellyfin account on each server — so each person's
+   * watch state stays separate and in sync across servers.
+   * @param {import('./catalogue.js').UserCtx} user
    */
-  async report({ uid, event, positionSeconds, durationSeconds = 0, playSessionId, serverIndex, mediaSourceId, playMethod, paused = false }) {
+  async report(user, { uid, event, positionSeconds, durationSeconds = 0, playSessionId, serverIndex, mediaSourceId, playMethod, paused = false }) {
     const variants = decodeUid(uid);
     const playing = variants?.find((v) => v.s === serverIndex);
-    if (!playing || !this.servers[serverIndex]) throw new HttpError(400, 'Bad playback report');
-    const srv = this.servers[serverIndex];
+    const srv = this.reg.get(serverIndex);
+    if (!playing || !srv) throw new HttpError(400, 'Bad playback report');
     const ticks = Math.round(positionSeconds * 1e7);
 
     try {
-      await srv.reportPlayback(event === 'start' ? '' : event === 'stop' ? 'Stopped' : 'Progress', {
-        ItemId: playing.id,
-        MediaSourceId: mediaSourceId,
-        PlaySessionId: playSessionId,
-        PositionTicks: ticks,
-        IsPaused: !!paused,
-        CanSeek: true,
-        PlayMethod: playMethod || 'DirectPlay',
-      });
+      // Skipped when Jellyfin would attribute the session to a different account than the
+      // viewer (see JellyfinServer.sessionMatches); the explicit user-data write below is canonical.
+      const jf = this.jf(user, serverIndex) || (await srv.userId());
+      if (await srv.sessionMatches(jf)) {
+        await srv.reportPlayback(event === 'start' ? '' : event === 'stop' ? 'Stopped' : 'Progress', {
+          ItemId: playing.id,
+          MediaSourceId: mediaSourceId,
+          PlaySessionId: playSessionId,
+          PositionTicks: ticks,
+          IsPaused: !!paused,
+          CanSeek: true,
+          PlayMethod: playMethod || 'DirectPlay',
+        });
+      }
     } catch {
       /* a failed session report must not break playback */
     }
@@ -211,7 +240,9 @@ export class Playback {
       const data = finished
         ? { Played: true, PlaybackPositionTicks: 0, LastPlayedDate: new Date().toISOString() }
         : { PlaybackPositionTicks: ticks, LastPlayedDate: new Date().toISOString() };
-      await Promise.allSettled(variants.filter((v) => this.servers[v.s]?.online !== false).map((v) => this.servers[v.s].writeUserData(v.id, data)));
+      await Promise.allSettled(
+        variants.filter((v) => this.reg.get(v.s)?.online === true || this.reg.get(v.s)?.online === null).map((v) => this.reg.get(v.s).writeUserData(v.id, data, this.jf(user, v.s))),
+      );
     }
 
     if (event === 'stop') {

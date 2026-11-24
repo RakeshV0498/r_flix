@@ -2,7 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { encodeUid, decodeUid } from '../src/ids.js';
 import { mergeLibraries, mergeUd, slim } from '../src/catalogue.js';
-import { loadConfig, ConfigError } from '../src/config.js';
+import { loadBootstrap, readLegacy, ConfigError } from '../src/config.js';
+import { encrypt, decrypt } from '../src/crypto.js';
+import { hashPassword, verifyPassword, LoginLimiter } from '../src/auth.js';
+import { openDb } from '../src/db.js';
+import { Settings } from '../src/settings.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { rewritePlaylist } from '../src/proxy.js';
 import { deviceProfile } from '../src/playback.js';
 
@@ -78,15 +86,76 @@ test('slim() keeps only what we need and normalises ids', () => {
   assert.equal(s.hasBackdrop, false);
 });
 
-test('config: env overrides file, requires credentials, never needs hardcoding', () => {
-  const env = { RFLIX_CONFIG: '/nonexistent.json', JELLYFIN_1_URL: 'http://10.0.0.5:8096/', JELLYFIN_1_API_KEY: 'k', JELLYFIN_2_URL: 'http://10.0.0.6:8096', JELLYFIN_2_USERNAME: 'u', JELLYFIN_2_PASSWORD: 'p', PORT: '9000' };
-  const cfg = loadConfig(env);
-  assert.equal(cfg.servers.length, 2);
-  assert.equal(cfg.servers[0].url, 'http://10.0.0.5:8096'); // trailing slash trimmed
-  assert.equal(cfg.port, 9000);
-  assert.throws(() => loadConfig({ RFLIX_CONFIG: '/nonexistent.json' }), ConfigError);
-  assert.throws(() => loadConfig({ RFLIX_CONFIG: '/x', JELLYFIN_1_URL: 'http://a' }), /apiKey/);
-  assert.throws(() => loadConfig({ RFLIX_CONFIG: '/x', JELLYFIN_1_URL: 'nope', JELLYFIN_1_API_KEY: 'k' }), /http/);
+test('bootstrap config: only port, data dir and proxy trust come from the environment', () => {
+  const b = loadBootstrap({ PORT: '9000', RFLIX_DATA: 'mydata', RFLIX_TRUST_PROXY: '1' }, '/srv');
+  assert.deepEqual(b, { port: 9000, dataDir: '/srv/mydata', trustProxy: true });
+  assert.equal(loadBootstrap({}, '/srv').dataDir, '/srv/data');
+  assert.throws(() => loadBootstrap({ PORT: 'abc' }), ConfigError);
+});
+
+test('legacy config (file + env) is read for one-time import; nothing configured is not an error', () => {
+  assert.deepEqual(readLegacy({ RFLIX_CONFIG: '/nonexistent.json' }), { servers: [], settings: {} });
+  const l = readLegacy({
+    RFLIX_CONFIG: '/nonexistent.json',
+    JELLYFIN_1_URL: 'http://10.0.0.5:8096/', JELLYFIN_1_API_KEY: 'k',
+    JELLYFIN_2_URL: 'http://10.0.0.6:8096', JELLYFIN_2_USERNAME: 'u', JELLYFIN_2_PASSWORD: 'p', JELLYFIN_2_NAME: 'NAS',
+    RFLIX_CACHE_TTL: '600',
+  });
+  assert.deepEqual(l.servers.map((s) => [s.name, s.authType]), [['Server 1', 'apikey'], ['NAS', 'login']]);
+  assert.equal(l.settings.cacheTtlSeconds, 600);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rflix-legacy-'));
+  fs.writeFileSync(path.join(dir, 'bad.json'), '{ nope');
+  assert.throws(() => readLegacy({ RFLIX_CONFIG: path.join(dir, 'bad.json') }), ConfigError);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('secrets: AES-GCM round-trips, uses a fresh IV, and detects tampering or the wrong key', () => {
+  const key = crypto.randomBytes(32);
+  const blob = encrypt(key, 'my-api-key');
+  assert.notEqual(blob, encrypt(key, 'my-api-key'));
+  assert.ok(!blob.includes('my-api-key'));
+  assert.equal(decrypt(key, blob), 'my-api-key');
+  assert.throws(() => decrypt(crypto.randomBytes(32), blob));
+  const parts = blob.split('.');
+  parts[3] = Buffer.from('tampered').toString('base64url');
+  assert.throws(() => decrypt(key, parts.join('.')));
+});
+
+test('passwords: scrypt hashes are salted and verify correctly', async () => {
+  const h1 = await hashPassword('correct horse');
+  const h2 = await hashPassword('correct horse');
+  assert.notEqual(h1, h2);
+  assert.ok(h1.startsWith('scrypt$') && !h1.includes('correct horse'));
+  assert.equal(await verifyPassword('correct horse', h1), true);
+  assert.equal(await verifyPassword('wrong', h1), false);
+  assert.equal(await verifyPassword('x', 'garbage'), false);
+});
+
+test('login limiter locks a key after repeated failures and clears on success', () => {
+  const l = new LoginLimiter({ maxFails: 3 });
+  for (let i = 0; i < 2; i++) l.fail('1.2.3.4', 'Bob');
+  assert.equal(l.wait('1.2.3.4', 'bob'), 0);
+  l.fail('1.2.3.4', 'bob');
+  assert.ok(l.wait('1.2.3.4', 'BOB') > 0); // case-insensitive
+  assert.equal(l.wait('1.2.3.4', 'alice'), 0);
+  assert.equal(l.wait('9.9.9.9', 'bob'), 0);
+  l.success('1.2.3.4', 'bob');
+  assert.equal(l.wait('1.2.3.4', 'bob'), 0);
+  clearInterval(l.timer);
+});
+
+test('settings: validated, all-or-nothing, persisted, and one live object', () => {
+  const db = openDb(':memory:');
+  const s = new Settings(db);
+  const live = s.values;
+  let changed;
+  s.on('change', (k) => { changed = k; });
+  s.update({ playback: { maxBitrateMbps: 9 }, cacheTtlSeconds: 60 });
+  assert.equal(live.playback.maxBitrateMbps, 9); // the same object everyone holds
+  assert.deepEqual(changed.sort(), ['cacheTtlSeconds', 'playback.maxBitrateMbps']);
+  assert.throws(() => s.update({ cacheTtlSeconds: 120, playback: { maxBitrateMbps: 9999 } }), /between/);
+  assert.equal(live.cacheTtlSeconds, 60); // the valid half was not applied
+  assert.equal(new Settings(db).values.playback.maxBitrateMbps, 9); // reloaded from the database
 });
 
 test('playlist rewriting hides server addresses and tokens', () => {

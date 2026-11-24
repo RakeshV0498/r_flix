@@ -298,9 +298,13 @@ export class JellyfinServer extends EventEmitter {
     });
   }
 
+  // The methods below take the Jellyfin user to act as. With an API key (or an admin login)
+  // r_flix can act as any user on the server, which is how each r_flix user gets their own
+  // watch history. Omit it to act as the server's default ("catalogue") user.
+
   /** "Continue watching": partially watched movies/episodes, newest first. */
-  async resume(limit = 20) {
-    const userId = await this.userId();
+  async resume(userId, limit = 20) {
+    userId ||= await this.userId();
     const query = { userId, Limit: limit, MediaTypes: 'Video', Fields: 'Overview', EnableTotalRecordCount: false };
     const r = await this.jsonCompat('resume', [
       { path: '/UserItems/Resume', query },
@@ -310,32 +314,32 @@ export class JellyfinServer extends EventEmitter {
   }
 
   /** Next unwatched episode of each series the user is following. */
-  async nextUp(limit = 20) {
+  async nextUp(userId, limit = 20) {
     const r = await this.json('/Shows/NextUp', {
-      query: { userId: await this.userId(), Limit: limit, Fields: 'Overview', EnableTotalRecordCount: false },
+      query: { userId: userId || (await this.userId()), Limit: limit, Fields: 'Overview', EnableTotalRecordCount: false },
     });
     return r?.Items || [];
   }
 
   /** Full details for one item (cast, studios, ...), including this user's watch state. */
-  async item(id) {
+  async item(id, userId) {
     const r = await this.json('/Items', {
-      query: { userId: await this.userId(), Ids: id, Fields: 'Overview,People,Genres,Studios,Taglines,ProviderIds' },
+      query: { userId: userId || (await this.userId()), Ids: id, Fields: 'Overview,People,Genres,Studios,Taglines,ProviderIds' },
     });
     return r?.Items?.[0] || null;
   }
 
   /** Every episode of a series (all seasons). */
-  async episodes(seriesId) {
+  async episodes(seriesId, userId) {
     const r = await this.json(`/Shows/${seriesId}/Episodes`, {
-      query: { userId: await this.userId(), Fields: 'Overview', isMissing: false },
+      query: { userId: userId || (await this.userId()), Fields: 'Overview', isMissing: false },
     });
     return r?.Items || [];
   }
 
   /** Ask Jellyfin whether the item can be direct-played, and how to transcode if not. */
-  async playbackInfo(id, body) {
-    const userId = await this.userId();
+  async playbackInfo(id, body, userId) {
+    userId ||= await this.userId();
     return this.json(`/Items/${id}/PlaybackInfo`, { method: 'POST', query: { userId }, body: { UserId: userId, ...body } });
   }
 
@@ -345,8 +349,8 @@ export class JellyfinServer extends EventEmitter {
   }
 
   /** Persist resume position / watched flag for the authenticated user. */
-  async writeUserData(id, data) {
-    const userId = await this.userId();
+  async writeUserData(id, data, userId) {
+    userId ||= await this.userId();
     await this.jsonCompat(
       'userdata',
       [
@@ -355,6 +359,43 @@ export class JellyfinServer extends EventEmitter {
       ],
       { method: 'POST', body: data },
     );
+  }
+
+  /**
+   * Watch state of specific items for one user (one request per chunk of ids). Used to overlay
+   * each person's own played/progress markers on the shared catalogue.
+   * @returns {Promise<Map<string, object>>} jellyfin id -> UserData
+   */
+  async userStates(ids, userId) {
+    userId ||= await this.userId();
+    const out = new Map();
+    for (let i = 0; i < ids.length; i += 100) {
+      const r = await this.json('/Items', { query: { userId, Ids: ids.slice(i, i + 100).join(','), EnableTotalRecordCount: false } });
+      for (const it of r?.Items || []) out.set(String(it.Id).replace(/-/g, '').toLowerCase(), it.UserData || {});
+    }
+    return out;
+  }
+
+  /** The server's user accounts (needs an API key or admin login): used to map r_flix users. */
+  async users() {
+    const list = await this.json('/Users');
+    return (list || []).map((u) => ({
+      id: u.Id.replace(/-/g, '').toLowerCase(),
+      name: u.Name,
+      isAdmin: !!u.Policy?.IsAdministrator,
+      isDisabled: !!u.Policy?.IsDisabled,
+    }));
+  }
+
+  /**
+   * Should playback session reports (Sessions/Playing...) be sent for this Jellyfin user?
+   * Jellyfin attributes a session to the *token's* user. An API key has no user, so there is
+   * nothing to mis-attribute; with a password login, reporting for anyone but that login user
+   * would wrongly write watch history onto the login account — so we don't.
+   */
+  async sessionMatches(jfUserId) {
+    if (this.cfg.apiKey) return true;
+    return (await this.userId()) === jfUserId;
   }
 
   /** Best-effort: tell Jellyfin to stop an ffmpeg transcode for this play session. */

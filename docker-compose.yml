@@ -1,4 +1,6 @@
 # docker compose up -d --build
+# Then open http://<pi-address>:8080 and create the admin account.
+# The setup code is in the log:  docker compose logs r_flix
 services:
   r_flix:
     build: .
@@ -8,13 +10,14 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Put your config at ./config/config.json (copy config/config.sample.json).
-      - ./config:/config:ro
+      # Users, Jellyfin servers and settings (SQLite) + the key that encrypts stored credentials.
+      # BACK THIS UP. (Or set RFLIX_SECRET below to keep the key out of the volume.)
+      - rflix-data:/data
     environment:
-      RFLIX_CONFIG: /config/config.json
-      # Or skip the file and set servers here / in an env_file (see .env.example):
-      # JELLYFIN_1_URL: http://192.168.1.10:8096
-      # JELLYFIN_1_API_KEY: ${JELLYFIN_1_API_KEY}
+      # RFLIX_SECRET: "a-long-random-string"   # optional: encrypt stored credentials with this instead of /data/secret.key
+      # RFLIX_TRUST_PROXY: "1"                 # set when running behind a reverse proxy (HTTPS)
+      # RFLIX_SETUP_CODE: "choose-a-code"      # optional: fixed first-run code instead of a random one in the log
+      TZ: UTC
     # Pi 3B+ has 1 GB RAM: keep the container small (r_flix idles well under 100 MB).
     mem_limit: 256m
     # Fewer writes = longer SD card life.
@@ -23,3 +26,6 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+volumes:
+  rflix-data:

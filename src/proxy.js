@@ -72,10 +72,11 @@ export function rewritePlaylist(text, serverIndex, upstreamBase) {
     .replace(/[?&](?:api_key|apikey)=[^&\s"]*/gi, '');
 }
 
-export function mountProxy(app, servers) {
+/** @param {import('./servers.js').ServerRegistry} reg  (callers must have authenticated the request) */
+export function mountProxy(app, reg) {
   app.get('/proxy/:server(\\d)/*', async (req, res, next) => {
     try {
-      const srv = servers[Number(req.params.server)];
+      const srv = reg.get(Number(req.params.server));
       if (!srv) throw new HttpError(404, 'Unknown server');
       // Use the raw (still-encoded) path so "%2e%2e/" tricks can't sneak past the allow-list.
       const pathname = req.path.slice(`/proxy/${req.params.server}`.length);
@@ -133,7 +134,7 @@ function limiter(max) {
   };
 }
 
-export function mountImages(app, servers) {
+export function mountImages(app, reg) {
   const acquire = limiter(6);
   app.get('/api/img/:uid/:kind', async (req, res, next) => {
     try {
@@ -148,7 +149,7 @@ export function mountImages(app, servers) {
 
       for (const kind of kinds) {
         for (const v of variants) {
-          const srv = servers[v.s];
+          const srv = reg.get(v.s);
           if (!srv || srv.online === false) continue;
           try {
             const { res: up } = await srv.raw(`/Items/${v.id}/Images/${kind}`, { query: { maxWidth: width, quality: 85 }, signal, headers: { Accept: 'image/*' } });

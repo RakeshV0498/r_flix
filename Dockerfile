@@ -1,9 +1,11 @@
 # r_flix — small image for a Raspberry Pi 3B+ (1 GB RAM). Multi-arch: builds natively on arm64/armv7/amd64.
 FROM node:22-alpine
 
-# Cap the V8 heap well under the container limit so the Pi never swaps.
+# Cap the V8 heap well under the container limit so the Pi never swaps. node:sqlite is
+# still flagged "experimental" by Node (it is stable in practice), so silence that one warning.
 ENV NODE_ENV=production \
-    NODE_OPTIONS=--max-old-space-size=160
+    NODE_OPTIONS="--max-old-space-size=160 --disable-warning=ExperimentalWarning" \
+    RFLIX_DATA=/data
 
 WORKDIR /app
 
@@ -15,7 +17,11 @@ RUN npm ci --omit=dev \
 
 COPY src ./src
 COPY public ./public
-COPY config/config.sample.json ./config/config.sample.json
+
+# The database (users, servers, settings) and the encryption key live here. Mount a volume so
+# they survive rebuilds. Created and owned by the unprivileged user so a fresh volume is writable.
+RUN mkdir /data && chown node:node /data
+VOLUME /data
 
 USER node
 EXPOSE 8080
