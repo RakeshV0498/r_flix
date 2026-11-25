@@ -189,3 +189,8 @@ addEventListener('rflix:unauthorized', () => {
     view.replaceChildren(h('div', { class: 'page' }, h('p', { class: 'error' }, err.message)));
   }
 })();
+
+// Installable app: register the service worker (browsers only allow this on HTTPS or localhost).
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch((err) => console.warn('service worker not registered:', err.message)));
+}

@@ -113,9 +113,58 @@ If the database has **no servers yet**, `config/config.json` (and `JELLYFIN_<n>_
 - **Sign-in:** passwords are hashed with scrypt (per-user salt). Sessions are random tokens in an `HttpOnly`, `SameSite=Lax` cookie; only a hash of the token is stored. Failed sign-ins are throttled per account and per address.
 - **Everything needs a session:** the catalogue, artwork, and video proxy all require sign-in. Disabling or deleting a user, resetting their password, or changing your own password signs out the affected sessions.
 - **Jellyfin credentials** are stored encrypted (AES-256-GCM) and never sent to the browser. By default the key is `secret.key` in the data directory; set `RFLIX_SECRET` to keep it elsewhere. Losing the key makes saved credentials unreadable: re-enter them on the Admin page.
-- **No HTTPS built in.** On a home LAN, plain HTTP works. If you expose r_flix beyond your network, put it behind a reverse proxy with HTTPS (and set `RFLIX_TRUST_PROXY=1`) or use a VPN.
+- **No HTTPS built in.** On a home LAN, plain HTTP works. To share with others, use the Tailscale add-on below (private HTTPS, no open ports). If you use a different reverse proxy with HTTPS instead, set `RFLIX_TRUST_PROXY=1`. Don't forward the plain HTTP port to the internet.
 - **Library visibility is shared.** Everyone sees the same titles (the catalogue is built from each server's default user). Per-person mapping separates *watch history*, not parental controls or library access: Jellyfin's per-user restrictions are not enforced inside r_flix.
 - `/proxy` only forwards an allow-list of media paths and drops any credentials in the query string, so it can't be used to reach the rest of the Jellyfin API.
+
+## Share with friends and family (Tailscale) and install as an app
+
+[Tailscale](https://tailscale.com) is a free private network. With the included add-on, r_flix gets an **HTTPS address that only you and the people you invite can reach**. Nothing is opened on your router and r_flix is never on the public internet. HTTPS also unlocks **Install app** in browsers.
+
+### One-time setup (about 5 minutes)
+
+1. **Create a free Tailscale account** at tailscale.com.
+2. In the [admin console → DNS](https://login.tailscale.com/admin/dns), turn on **MagicDNS** and **HTTPS Certificates**. The HTTPS address won't work without this.
+3. In [Settings → Keys](https://login.tailscale.com/admin/settings/keys), **Generate auth key** (the defaults are fine) and copy it.
+4. On the Pi, in the r_flix folder:
+
+   ```bash
+   git pull
+   echo 'TS_AUTHKEY=tskey-auth-PASTE-YOUR-KEY' >> .env
+   echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.tailscale.yml' >> .env
+   docker compose up -d --build
+   docker compose logs tailscale     # look for "Serving ... https://rflix.<name>.ts.net"
+   ```
+
+   (`COMPOSE_FILE` just saves typing both files every time.)
+5. Open **`https://rflix.<your-tailnet>.ts.net`** from any device signed in to your Tailscale account (the exact name is in the log and under *Machines* in the admin console). It shows the same r_flix sign-in as `http://<pi>:8080`, which keeps working on your home network.
+
+### Invite someone
+
+1. They install the Tailscale app (Android, iPhone, Windows, Mac, Linux, **Android TV / Google TV / Fire TV / Apple TV**) and make their own free Tailscale account.
+2. In the Tailscale admin console go to **Machines → `rflix` → ⋯ → Share…**, and send them the link. They accept it, and `rflix` appears for them. Sharing gives access to **that one machine only**, not your other devices. (Check Tailscale's current plan limits on sharing.)
+3. In r_flix, **Admin → Users → Add user** for them, and **Link by username** if they have their own Jellyfin accounts.
+4. They open `https://rflix.<your-tailnet>.ts.net` and sign in with the r_flix account you made.
+
+### Install it as an app
+
+Use the **HTTPS** address, not the plain LAN one.
+
+| Device | How |
+|---|---|
+| Android (Chrome) | Menu ⋮ → **Install app** |
+| iPhone / iPad (Safari) | Share → **Add to Home Screen** |
+| Windows / Mac / Linux (Chrome, Edge) | The install icon at the right of the address bar |
+| Android TV / Google TV / Fire TV | Run the Tailscale app, then open the HTTPS address in a browser. TV remotes work: arrows, Enter and Back are handled. |
+| Samsung / LG TV | These TVs have no Tailscale app. Use a Fire TV Stick or Google TV box, or cast from a phone. |
+
+The installed app opens full screen with its own icon. It only caches the page itself: your library, artwork and video are always fetched live and never stored by the app.
+
+### Things to know when sharing
+
+- **Your upload speed and your Jellyfin servers are the limit**, not the Pi: each remote viewer's stream leaves your home connection, and transcoding happens on the Jellyfin servers. Lower **Admin → Settings → Maximum bitrate** (for example 4-8 Mbit/s) if you share with several people.
+- Tailscale hands r_flix each person's address, so sign-in throttling works per person. Failed sign-ins are also limited per account, so guessing one password from many places doesn't get around it.
+- To stop sharing with someone: remove the share in the Tailscale console and/or disable their user in **Admin → Users**.
 
 ## Raspberry Pi 3B+ notes
 

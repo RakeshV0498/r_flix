@@ -219,16 +219,24 @@ const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('h
  * growing time (1 min, 2 min, ... capped at 15). Keys: "ip|username" and "ip".
  */
 export class LoginLimiter {
-  constructor({ maxFails = 5, ipMaxFails = 25 } = {}) {
+  constructor({ maxFails = 5, ipMaxFails = 25, acctMaxFails = 10 } = {}) {
     this.maxFails = maxFails;
     this.ipMaxFails = ipMaxFails;
+    this.acctMaxFails = acctMaxFails;
     this.map = new Map(); // key -> { fails, until }
     this.timer = setInterval(() => this.prune(), 600_000);
     this.timer.unref();
   }
 
+  /**
+   * Three counters: this address + this account, this address overall, and this account from
+   * ANYWHERE. The last one matters behind a reverse proxy (RFLIX_TRUST_PROXY), where a client can
+   * forge its forwarded address to dodge the per-address counters: guessing one person's password
+   * from many "addresses" still hits the account limit.
+   */
   keys(ip, username) {
-    return [[`${ip}|${String(username).toLowerCase()}`, this.maxFails], [ip, this.ipMaxFails]];
+    const name = String(username).toLowerCase();
+    return [[`${ip}|${name}`, this.maxFails], [ip, this.ipMaxFails], [`acct|${name}`, this.acctMaxFails]];
   }
 
   /** @returns {number} seconds to wait, or 0 if allowed */
@@ -253,7 +261,9 @@ export class LoginLimiter {
   }
 
   success(ip, username) {
-    this.map.delete(`${ip}|${String(username).toLowerCase()}`);
+    const name = String(username).toLowerCase();
+    this.map.delete(`${ip}|${name}`);
+    this.map.delete(`acct|${name}`); // a correct password proves it's the owner
   }
 
   prune() {

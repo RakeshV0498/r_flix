@@ -1,0 +1,41 @@
+# Share r_flix privately over Tailscale, with HTTPS (needed for "Install app").
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tailscale.yml up -d --build
+#
+# What you get: https://rflix.<your-tailnet>.ts.net, reachable ONLY by devices on your Tailscale
+# network (you, plus anyone you share the "rflix" machine with). Nothing is opened on your router
+# and r_flix is NOT exposed to the public internet (no Funnel). Setup steps: README, "Share with
+# friends and family".
+services:
+  r_flix:
+    environment:
+      # r_flix sits behind the Tailscale proxy, so trust its forwarded address/protocol.
+      RFLIX_TRUST_PROXY: "1"
+
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: r_flix-tailscale
+    hostname: rflix
+    restart: unless-stopped
+    depends_on:
+      - r_flix
+    environment:
+      # Create a key at https://login.tailscale.com/admin/settings/keys and put it in .env
+      # (TS_AUTHKEY=tskey-auth-...). Without a key, the container prints a login link in its log.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: rflix
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true" # no /dev/net/tun or extra privileges needed
+      TS_SERVE_CONFIG: /config/serve.json # publish r_flix on https://rflix.<tailnet>.ts.net
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale:/config:ro
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  tailscale-state:

@@ -408,7 +408,15 @@ export function createApp({ dataDir, trustProxy = false, legacy = { servers: [],
     res.sendFile(hlsFile);
   });
   // No runtime compression (wasted CPU on a Pi); files are small and cached with ETags.
-  app.use(express.static(publicDir, { maxAge: '1h' }));
+  app.use(
+    express.static(publicDir, {
+      maxAge: '1h',
+      setHeaders(res, file) {
+        // The service worker and manifest must always be revalidated, or app updates could be missed.
+        if (/[\\/](sw\.js|manifest\.webmanifest)$/.test(file)) res.setHeader('Cache-Control', 'no-cache');
+      },
+    }),
+  );
 
   // ---- errors
   // eslint-disable-next-line no-unused-vars
