@@ -145,7 +145,8 @@ export async function mount(root, { id, goBack }) {
     try {
       info = await get(`/api/play/${id}?${q}`);
     } catch (err) {
-      if (!S.destroyed) showError(err.status === 503 ? 'No reachable server has this title right now.' : err.message);
+      // The server's message says which server is offline (or what went wrong); show it as it is.
+      if (!S.destroyed) showError(`${err.message}${/[.!?]$/.test(err.message) ? '' : '.'}`);
       return;
     }
     if (S.destroyed) return;
