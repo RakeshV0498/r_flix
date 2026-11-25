@@ -1,5 +1,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import http from 'node:http';
 import { bootStack, makeClient } from './helpers.js';
 import { LoginLimiter } from '../src/auth.js';
 
@@ -34,6 +36,40 @@ test('installable app: manifest, icons and service worker are public and well-fo
   assert.equal(sw.headers.get('cache-control'), 'no-cache'); // updates must reach installed copies
   assert.match(sw.headers.get('content-type'), /javascript/);
   assert.match(await (await fetch(s.base + '/')).text(), /rel="manifest"/);
+});
+
+test('app updates reach users immediately: code is always revalidated, never served stale from a cache', async () => {
+  // Regression: scripts used to be cached for an hour, so after an update browsers kept running the old
+  // player (and its old failure handling) until the cache expired.
+  for (const p of ['/', '/index.html', '/js/app.js', '/js/player.js', '/css/app.css', '/sw.js', '/manifest.webmanifest']) {
+    const r = await fetch(s.base + p);
+    assert.equal(r.status, 200, p);
+    assert.equal(r.headers.get('cache-control'), 'no-cache', p);
+    assert.ok(r.headers.get('etag'), `${p} needs an ETag so revalidation is a cheap 304`);
+  }
+  // A conditional request for an unchanged file costs almost nothing.
+  // (Raw http: fetch() adds "Cache-Control: no-cache" itself when given If-None-Match, which would defeat a 304.)
+  const first = await fetch(s.base + '/js/player.js');
+  const status = await new Promise((resolve, reject) =>
+    http.get(s.base + '/js/player.js', { headers: { 'If-None-Match': first.headers.get('etag') } }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject));
+  assert.equal(status, 304);
+  // Icons never change between versions, so they may be cached for a day.
+  assert.match((await fetch(s.base + '/icons/icon-192.png')).headers.get('cache-control'), /max-age=86400/);
+  // The service worker must go to the server too, not trust the browser's HTTP cache.
+  assert.match(await (await fetch(s.base + '/sw.js')).text(), /fetch\(req, \{ cache: 'no-cache' \}\)/);
+});
+
+test('the service worker precaches every script, so the app shell opens offline', async () => {
+  const sw = await (await fetch(s.base + '/sw.js')).text();
+  const listed = new Set([...sw.matchAll(/'(\/[^']*)'/g)].map((m) => m[1]));
+  const dir = new URL('../public/js/', import.meta.url);
+  for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+    assert.ok(listed.has(`/js/${file}`), `public/js/${file} is missing from PRECACHE in public/sw.js`);
+  }
+  for (const p of listed) {
+    if (p === '/') continue;
+    assert.equal((await fetch(s.base + p)).status, 200, `${p} is listed for precaching but is not served`);
+  }
 });
 
 test('service worker never touches the API, video or artwork', async () => {

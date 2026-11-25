@@ -407,13 +407,15 @@ export function createApp({ dataDir, trustProxy = false, legacy = { servers: [],
     }
     res.sendFile(hlsFile);
   });
-  // No runtime compression (wasted CPU on a Pi); files are small and cached with ETags.
+  // No runtime compression (wasted CPU on a Pi). Pages, scripts and styles are revalidated on every
+  // load: the browser asks "has it changed?" and gets a tiny 304 if not (ETags), so an update to r_flix
+  // reaches everyone on their next visit instead of up to an hour later. Only the icons are cached long.
   app.use(
     express.static(publicDir, {
-      maxAge: '1h',
+      maxAge: 0,
       setHeaders(res, file) {
-        // The service worker and manifest must always be revalidated, or app updates could be missed.
-        if (/[\\/](sw\.js|manifest\.webmanifest)$/.test(file)) res.setHeader('Cache-Control', 'no-cache');
+        if (/[\\/]icons[\\/]/.test(file)) res.setHeader('Cache-Control', 'public, max-age=86400');
+        else res.setHeader('Cache-Control', 'no-cache');
       },
     }),
   );

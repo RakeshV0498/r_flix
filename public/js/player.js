@@ -249,7 +249,8 @@ export async function mount(root, { id, goBack }) {
       } else {
         // Nowhere left to go. Say what actually happened instead of a vague "not reachable".
         const detail = S.info ? await explain(S.info.url) : '';
-        showError(`Couldn't play this${S.info ? ` from ${S.info.serverName}` : ''}. ${detail}`.trim());
+        // The bracket is the technical reason (browser error code, delivery method): useful when reporting a problem.
+        showError(`Couldn't play this${S.info ? ` from ${S.info.serverName}` : ''}. ${detail} [${why}${S.info ? `, ${S.info.playMethod}/${S.info.mode}` : ''}]`.trim());
         return;
       }
       await start(pos);

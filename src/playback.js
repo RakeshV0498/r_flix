@@ -156,6 +156,16 @@ export class Playback {
       throw new Error('server offered neither direct play nor a transcode');
     }
 
+    // One line per play: how this file is being delivered and, if Jellyfin chose to transcode, why.
+    // It is the first thing to look at when a video will not play (docker compose logs r_flix).
+    const vs = (ms.MediaStreams || []).find((x) => x.Type === 'Video');
+    const au = (ms.MediaStreams || []).find((x) => x.Type === 'Audio' && x.IsDefault) || (ms.MediaStreams || []).find((x) => x.Type === 'Audio');
+    const reasons = /[?&]TranscodeReasons=([^&]*)/i.exec(ms.TranscodingUrl || '')?.[1];
+    console.log(
+      `[play] ${srv.name}: ${playMethod} via ${mode} container=${ms.Container} video=${vs?.Codec ?? '?'}${vs?.Profile ? ` ${vs.Profile}` : ''}${vs?.BitDepth ? ` ${vs.BitDepth}bit` : ''}` +
+        ` audio=${au?.Codec ?? '?'}${au?.Channels ? ` ${au.Channels}ch` : ''}${reasons ? ` transcode-reasons=${decodeURIComponent(reasons)}` : ''}`,
+    );
+
     const runtimeTicks = ms.RunTimeTicks || meta?.RunTimeTicks || 0;
     const durationSeconds = runtimeTicks / 1e7;
     let startSeconds = Number.isFinite(start) ? start : !ud.played && ud.pos > 0 ? ud.pos / 1e7 : 0;

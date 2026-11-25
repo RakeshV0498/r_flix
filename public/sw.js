@@ -7,12 +7,26 @@
  *   - shell files are fetched network-first, so an update to r_flix shows up on the next load
  *     (the cache is only a fallback), never a stale app.
  */
-const CACHE = 'rflix-shell-v1';
-const PRECACHE = ['/', '/css/app.css', '/js/app.js', '/favicon.svg', '/icons/icon-192.png'];
+const CACHE = 'rflix-shell-v2';
+// The WHOLE app shell, so it opens even when the server is slow, restarting or unreachable. (Keep in sync
+// with public/js: a test fails if a script is missing from this list.) Video, API and artwork are never listed.
+const PRECACHE = [
+  '/', '/css/app.css', '/manifest.webmanifest', '/favicon.svg', '/icons/icon-192.png',
+  '/js/app.js', '/js/api.js', '/js/util.js', '/js/ui.js', '/js/nav.js', '/js/status.js', '/js/cards.js',
+  '/js/auth.js', '/js/account.js', '/js/home.js', '/js/browse.js', '/js/search.js', '/js/detail.js', '/js/player.js',
+  '/js/admin.js', '/js/admin-servers.js', '/js/admin-users.js', '/js/admin-settings.js', '/js/admin-status.js',
+];
 const SHELL = /^\/(?:$|css\/|js\/|vendor\/|icons\/|favicon\.svg$|manifest\.webmanifest$)/;
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE)).then(() => self.skipWaiting()));
+  // cache:'reload' fetches fresh copies from the server, bypassing the browser's HTTP cache, so an
+  // update never precaches yesterday's scripts.
+  event.waitUntil(
+    caches
+      .open(CACHE)
+      .then((c) => c.addAll(PRECACHE.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (event) => {
@@ -34,7 +48,9 @@ self.addEventListener('fetch', (event) => {
 async function networkFirst(req) {
   const cache = await caches.open(CACHE);
   try {
-    const res = await fetch(req);
+    // cache:'no-cache' = always ask the server (conditional request), never trust the browser's own
+    // HTTP cache: otherwise an old copy could be served as if it were the network's answer.
+    const res = await fetch(req, { cache: 'no-cache' });
     if (res.ok && res.status === 200) cache.put(req, res.clone());
     return res;
   } catch (err) {
