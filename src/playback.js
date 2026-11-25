@@ -92,7 +92,13 @@ export class Playback {
     const variants = decodeUid(uid);
     if (!variants) throw new HttpError(400, 'Bad item id');
     const usable = variants.filter((v) => this.reg.get(v.s) && !exclude.has(v.s) && this.reg.get(v.s).online !== false);
-    if (!usable.length) throw new HttpError(503, 'No reachable server has this title right now');
+    if (!usable.length) {
+      // Say WHY: the copies' servers may be offline, or the player already tried them and failed.
+      const offline = variants.filter((v) => this.reg.get(v.s)?.online === false).map((v) => this.reg.get(v.s).name);
+      const skipped = variants.filter((v) => exclude.has(v.s)).length;
+      console.warn(`[play] no usable server: ${variants.length} copy(ies), offline=[${offline.join(', ')}], already-tried=${skipped}`);
+      throw new HttpError(503, offline.length ? `${[...new Set(offline)].join(' and ')} ${offline.length > 1 ? 'are' : 'is'} offline right now` : 'This title could not be played from any server that has it');
+    }
 
     // Metadata + this user's watch state from every reachable copy (for the resume position).
     const fetched = await Promise.allSettled(usable.map((v) => this.reg.get(v.s).item(v.id, this.jf(user, v.s))));
@@ -124,7 +130,8 @@ export class Playback {
         lastErr = err; // try the next copy on another server
       }
     }
-    throw new HttpError(502, `Could not start playback: ${lastErr?.message || 'unknown error'}`);
+    console.warn(`[play] could not start playback: ${lastErr?.message}`); // detail (may include addresses) stays in the log
+    throw new HttpError(502, `Could not start playback: ${lastErr?.publicMessage || (lastErr?.status ? `the server answered ${lastErr.status}` : 'unknown error')}`);
   }
 
   async _describe({ v, srv, info, ms, meta, ud, start, force, user }) {

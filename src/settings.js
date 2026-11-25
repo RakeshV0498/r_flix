@@ -8,6 +8,7 @@ import { HttpError } from './http-error.js';
 
 export const DEFAULTS = {
   cacheTtlSeconds: 300, // library refresh interval
+  mediaTimeoutSeconds: 90, // how long to wait for a server to START a video before giving up
   healthIntervalSeconds: 20, // how often servers are pinged
   requestTimeoutMs: 8000, // Jellyfin API call timeout
   dedupe: { fallbackToTitleYear: true },
@@ -22,6 +23,7 @@ export const DEFAULTS = {
 /** [dotted key, type, min, max, label] — drives validation (the UI mirrors this). */
 export const SCHEMA = [
   ['cacheTtlSeconds', 'int', 30, 86400],
+  ['mediaTimeoutSeconds', 'int', 10, 600],
   ['healthIntervalSeconds', 'int', 5, 3600],
   ['requestTimeoutMs', 'int', 1000, 60000],
   ['dedupe.fallbackToTitleYear', 'bool'],

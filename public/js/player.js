@@ -209,6 +209,22 @@ export async function mount(root, { id, goBack }) {
     video.load(); // closes the proxied connection so the Pi and Jellyfin stop sending
   }
 
+  /** Ask the stream URL what is wrong, so the error says more than "failed". */
+  async function explain(url) {
+    try {
+      const r = await fetch(url, { headers: { Range: 'bytes=0-1' }, signal: AbortSignal.timeout(25000) });
+      if (r.ok) {
+        r.body?.cancel();
+        return 'The server sent the video, but this browser could not play its format.';
+      }
+      let msg = '';
+      try { msg = (await r.json()).error; } catch { /* not JSON */ }
+      return msg ? `The server said: ${msg}.` : `The server answered with an error (${r.status}).`;
+    } catch (err) {
+      return err.name === 'TimeoutError' ? 'The server took too long to start the video.' : 'The server could not be reached.';
+    }
+  }
+
   /** Something broke: retry as a transcode, then try the other server. */
   async function onFailure(why) {
     if (S.destroyed || S.recovering) return;
@@ -219,16 +235,20 @@ export async function mount(root, { id, goBack }) {
       const serverDown = await get('/api/status')
         .then((s) => s.servers[S.info?.serverIndex]?.online === false)
         .catch(() => false);
+      // How many OTHER servers hold a copy? (the id lists every copy: "<slot><id>-<slot><id>")
+      const otherCopies = id.split('-').length - 1 - S.exclude.size;
       if (S.info?.playMethod === 'DirectPlay' && !S.forceTranscode && !serverDown) {
         S.forceTranscode = true; // maybe the browser can't decode the original file
         toast('Switching to a compatible stream…');
-      } else if (S.failovers < 2 && S.info) {
+      } else if (S.failovers < 2 && S.info && otherCopies > 0) {
         S.failovers++;
         S.forceTranscode = false;
         S.exclude.add(S.info.serverIndex);
         toast(`Trying another server… (${why})`);
       } else {
-        showError('Playback failed. The server may be offline or the file may be unsupported.');
+        // Nowhere left to go. Say what actually happened instead of a vague "not reachable".
+        const detail = S.info ? await explain(S.info.url) : '';
+        showError(`Couldn't play this${S.info ? ` from ${S.info.serverName}` : ''}. ${detail}`.trim());
         return;
       }
       await start(pos);

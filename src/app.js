@@ -395,7 +395,7 @@ export function createApp({ dataDir, trustProxy = false, legacy = { servers: [],
   // Video and artwork need a session too (the browser sends the cookie automatically).
   app.use(['/proxy', '/api/img'], requireAuth);
   mountImages(app, reg);
-  mountProxy(app, reg);
+  mountProxy(app, reg, settings);
 
   // =========================================================== front end
   const hasGz = fs.existsSync(hlsGzFile);
@@ -421,10 +421,13 @@ export function createApp({ dataDir, trustProxy = false, legacy = { servers: [],
   // ---- errors
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
-    const status = err instanceof HttpError ? err.status : err instanceof UpstreamError ? (err.network ? 503 : 502) : err.status || 500;
-    if (status >= 500) console.warn(`[${req.method} ${req.path}] ${err.message}`);
+    const status =
+      err instanceof HttpError ? err.status : err instanceof UpstreamError ? (err.timeout ? 504 : err.network ? 503 : 502) : err.status || 500;
+    if (status >= 500) console.warn(`[${req.method} ${req.path}] ${err.message}`); // full detail stays in the server log
+    // Viewers get a message without addresses or raw network errors (UpstreamError.publicMessage).
+    const shown = err instanceof UpstreamError ? err.publicMessage || `${status === 502 ? 'A server returned an error' : 'A server did not respond'}` : err.message;
     const safe = err instanceof HttpError || err instanceof UpstreamError || (status >= 400 && status < 500);
-    res.status(status).json({ error: safe ? err.message : 'Internal error' });
+    res.status(status).json({ error: safe ? shown : 'Internal error' });
   });
 
   const timers = [];

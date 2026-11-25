@@ -73,7 +73,7 @@ export function rewritePlaylist(text, serverIndex, upstreamBase) {
 }
 
 /** @param {import('./servers.js').ServerRegistry} reg  (callers must have authenticated the request) */
-export function mountProxy(app, reg) {
+export function mountProxy(app, reg, settings) {
   app.get('/proxy/:server(\\d)/*', async (req, res, next) => {
     try {
       const srv = reg.get(Number(req.params.server));
@@ -89,8 +89,20 @@ export function mountProxy(app, reg) {
       const headers = { Accept: '*/*' };
       for (const h of FORWARD_REQ) if (req.headers[h]) headers[h] = req.headers[h];
 
-      const { res: up } = await srv.raw(pathname, { query: query.toString(), headers, method: req.method, signal: abortOnClose(res) });
+      // Starting a stream can legitimately take a while (Jellyfin begins a transcode, spins up a disk,
+      // or reads a file from a remote mount), so wait far longer than for ordinary API calls.
+      const { res: up } = await srv.raw(pathname, {
+        query: query.toString(),
+        headers,
+        method: req.method,
+        signal: abortOnClose(res),
+        timeoutMs: settings.values.mediaTimeoutSeconds * 1000,
+      });
 
+      if (!up.ok && up.status !== 304) {
+        // Without this the server log says nothing about WHY a video would not start.
+        console.warn(`[proxy] ${srv.name} answered ${up.status} for ${pathname.replace(/^\/Videos\/[0-9a-f]{32}\//i, '…/')}`);
+      }
       res.status(up.status === 401 || up.status === 403 ? 502 : up.status);
       const isPlaylist = /mpegurl/i.test(up.headers.get('content-type') || '') || /\.m3u8$/i.test(pathname);
       if (isPlaylist && up.ok) {

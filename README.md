@@ -85,7 +85,8 @@ Everyone can change their own display name and password under **My account**.
 |---|---|---|
 | Library refresh interval | `300` s | How often each server's movie/show list is re-read |
 | Server check interval | `20` s | How often servers are pinged for the status dots |
-| Request timeout | `8000` ms | How long to wait for a server before treating it as unreachable |
+| Request timeout | `8000` ms | How long to wait for a server to answer an ordinary request |
+| Video start timeout | `90` s | How long to wait for a server to *start* a video (a transcode beginning, a cold disk, a remote mount). A slow answer never marks a server offline; only the periodic health check does |
 | Match duplicates by title + year | on | For items with no TMDB/IMDb/TVDB id |
 | Maximum bitrate | `12` Mbit/s | All video is relayed through r_flix's network port; keep it within what that can carry |
 | Allow HEVC | off | Turn on if your browsers/TVs decode H.265 (Safari, most smart TVs) |
@@ -203,6 +204,17 @@ The installed app opens full screen with its own icon. It only caches the page i
 **Item ids.** The browser only sees an opaque id that encodes every server's copy of an item (a stable server *slot* + the Jellyfin id). It never sees a server address, and ids survive re-ordering or renaming servers.
 
 **Watch state.** The library is shared; watch state is per user and fetched live (one request per server) and overlaid on the cards. Progress you make is written to every reachable copy of the title, as *your* Jellyfin account on each server. The most recently played copy wins when the servers disagree.
+
+## Troubleshooting playback
+
+When a video won't play, r_flix now says why on the player, and writes the detail to its log (`docker compose logs r_flix`; look for lines starting `[proxy]` or `[play]`).
+
+| You see | Likely cause |
+|---|---|
+| "The server said: … is offline" | That Jellyfin server isn't reachable from the Pi. Check **Admin → Status**. |
+| "… is taking too long to respond" / "took too long to start the video" | The server is slow to start the stream (a transcode starting on a small machine, a cold or remote disk). Raise **Admin → Settings → Video start timeout**, or lower the maximum bitrate so Jellyfin has less to transcode. |
+| "The server answered with an error (500)" | Jellyfin couldn't read or transcode the file: check its own log and that the media drive/mount is available. |
+| "The server sent the video, but this browser could not play its format" | The file needs transcoding but direct play was chosen, or the browser can't decode it. Try **Always transcode** in Settings, or allow HEVC if your device supports it. |
 
 ## Limitations
 

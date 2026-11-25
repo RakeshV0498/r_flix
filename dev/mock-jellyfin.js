@@ -118,6 +118,8 @@ export function createMockJellyfin(o) {
   app.use((req, res, next) => {
     stats.requests++;
     if (app.locals.down) return req.socket.destroy(); // simulate a dead server
+    const d = app.locals.delay; // simulate a SLOW server (cold disk, transcode starting...) for matching paths
+    if (d && d.re.test(req.path)) return setTimeout(next, d.ms);
     next();
   });
 
@@ -275,6 +277,8 @@ export function createMockJellyfin(o) {
     stop: () => new Promise((resolve) => { httpServer?.closeAllConnections?.(); httpServer ? httpServer.close(resolve) : resolve(); }),
     /** Simulate an outage: every connection is dropped until setDown(false). */
     setDown: (down) => { app.locals.down = down; },
+    /** Make requests whose path matches `re` answer only after `ms` (null = no delay). */
+    setDelay: (ms, re = /./) => { app.locals.delay = ms ? { ms, re } : null; },
     byName, episodeOf,
   };
 }

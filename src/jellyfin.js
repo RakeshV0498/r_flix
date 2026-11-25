@@ -16,11 +16,17 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 
 export class UpstreamError extends Error {
-  constructor(message, { status = 0, network = false, cause } = {}) {
+  /**
+   * `message` is for the server log and may contain addresses. `publicMessage` is what viewers
+   * may see: never an address, port or raw network error.
+   */
+  constructor(message, { status = 0, network = false, timeout = false, publicMessage, cause } = {}) {
     super(message, { cause });
     this.name = 'UpstreamError';
     this.status = status;
-    this.network = network;
+    this.network = network; // could not connect at all
+    this.timeout = timeout; // connected (or tried to) but no answer within our limit
+    this.publicMessage = publicMessage;
   }
 }
 
@@ -91,7 +97,7 @@ export class JellyfinServer extends EventEmitter {
   async checkHealth() {
     const t0 = performance.now();
     try {
-      const { res, clear } = await this._request('/System/Info/Public', { timeoutMs: 4000 });
+      const { res, clear } = await this._request('/System/Info/Public', { timeoutMs: 4000, markDownOnTimeout: true });
       try {
         if (res.ok) {
           const j = await res.json();
@@ -147,16 +153,31 @@ export class JellyfinServer extends EventEmitter {
     } catch (err) {
       clear();
       if (o.signal?.aborted) throw err; // the *caller* gave up (e.g. browser closed the tab): not a server fault
+      if (ctl.signal.aborted) {
+        // OUR time limit ran out: the server is slow (starting a transcode, waking a disk, reading a
+        // cloud file...), not necessarily down. Only the periodic health check may call it offline;
+        // otherwise one slow video start would take the whole server out of service.
+        if (o.markDownOnTimeout) this._markDown(new Error('timed out'));
+        throw new UpstreamError(`${this.name}: no response within ${Math.round((o.timeoutMs ?? this.timeoutMs) / 1000)}s`, {
+          timeout: true,
+          cause: err,
+          publicMessage: `${this.name} is taking too long to respond`,
+        });
+      }
       this._markDown(err.cause || err);
-      throw new UpstreamError(`${this.name}: unreachable (${(err.cause || err).message})`, { network: true, cause: err });
+      throw new UpstreamError(`${this.name}: unreachable (${(err.cause || err).message})`, {
+        network: true,
+        cause: err,
+        publicMessage: `${this.name} is not responding`,
+      });
     }
     this._markUp();
     if (res.status >= 300 && res.status < 400) {
       clear();
-      throw new UpstreamError(
-        `${this.name}: unexpected redirect to ${res.headers.get('location')} — set the final URL in the config`,
-        { status: res.status },
-      );
+      throw new UpstreamError(`${this.name}: unexpected redirect to ${res.headers.get('location')}; set the final address in Admin`, {
+        status: res.status,
+        publicMessage: `${this.name} is misconfigured (it redirected the request)`,
+      });
     }
     if (o.stream) clear();
     return { res, clear };
@@ -340,7 +361,9 @@ export class JellyfinServer extends EventEmitter {
   /** Ask Jellyfin whether the item can be direct-played, and how to transcode if not. */
   async playbackInfo(id, body, userId) {
     userId ||= await this.userId();
-    return this.json(`/Items/${id}/PlaybackInfo`, { method: 'POST', query: { userId }, body: { UserId: userId, ...body } });
+    // Generous timeout: the first request for a file makes Jellyfin probe it, which can take a while
+    // on a small server or a slow/remote disk.
+    return this.json(`/Items/${id}/PlaybackInfo`, { method: 'POST', query: { userId }, body: { UserId: userId, ...body }, timeoutMs: 30_000 });
   }
 
   /** Playback session reports: kind = '' (start) | 'Progress' | 'Stopped'. */
